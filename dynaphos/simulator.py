@@ -12,6 +12,8 @@ from dynaphos.utils import (to_tensor, get_data_kwargs, get_truncated_normal,
                             get_deg2pix_coeff, set_deterministic,
                             print_stats, sigmoid, to_numpy, Map)
 
+np.random.seed(None)
+
 class State:
     def __init__(self, params: dict, shape: Tuple[int, ...],
                  verbose: Optional[bool] = False):
@@ -71,15 +73,16 @@ class ActivationThreshold(State):
                  rng: np.random.Generator, verbose: Optional[bool] = False):
         super().__init__(params, shape, verbose)
         self.rng = rng
-        self._mu = self.params['thresholding']['activation_threshold']
-        self._sd = self.params['thresholding']['activation_threshold_sd']
+        # scaling...
+        self._mu = self.params['thresholding']['activation_threshold'] * self.params['thresholding']['a_thr_scaling']
+        self._sd = self.params['thresholding']['activation_threshold_sd'] * np.abs(self.params['thresholding']['a_thr_scaling'])
         self.reinitialize()
 
     def reinitialize(self, activation_thresholds: Optional[np.ndarray] = None):
         """Set or re-initialize the activation thresholds for each electrode. Default: sample from truncated random
         normal distribution."""
         if self.params['thresholding']['use_threshold']:
-            if activation_thresholds is None:
+            if activation_thresholds is None: # changed to scale
                 activation_thresholds = self.rng.standard_normal(self.shape) * self._sd + self._mu
             self.state = self.to_tensor(activation_thresholds).clip(0, None)
         else:
@@ -139,13 +142,25 @@ class Brightness(State):
 
 class Sigma(State):
     def __init__(self, params: dict, shape: Tuple[int, ...],
-                 magnification: torch.Tensor, verbose: Optional[bool] = False):
+                 magnification: torch.Tensor, verbose: Optional[bool] = False,
+                 device: Optional[torch.device] = torch.device('cpu')):
         super().__init__(params, shape, verbose)
 
         p = self.params['size']
+
+        self.z = p['Z1']
+        self.z_std = p['Z_std'] 
+
         if p['size_equation'] == 'sqrt':  # Tehovnik 2007
             def f(x):
-                return torch.sqrt(torch.div(x, p['current_spread']))
+                # return torch.sqrt(torch.div(x, p['current_spread']))
+                
+                return torch.sqrt(torch.div(torch.div(x, 
+                                                      p['current_spread']), 
+                                            torch.tensor(np.random.normal(loc=self.z, 
+                                                                          scale=self.z_std, 
+                                                                          size=(1000, 1, 1)),
+                                                                          device=device))) # if we want to initialize with some impedence
         elif p['size_equation'] == 'sigmoid':  # Bosking et al., 2017
             def f(x):
                 return 0.5 * p['MD'] * sigmoid(p['slope_size'] *
@@ -154,11 +169,25 @@ class Sigma(State):
             raise ValueError("Size equation should be 'sqrt' or 'sigmoid'.")
         self.f = f
         self.scale = p['radius_to_sigma'] / magnification
-    def update(self, x: torch.Tensor):
+
+    def update(self, x: torch.Tensor,
+               device: Optional[torch.device] = torch.device('cpu')):
         """Compute the effect of the input current on phosphene size."""
 
         # Current spread to sigma in pixels.
-        self.state = torch.mul(self.f(x), self.scale)
+        # self.state = torch.mul(self.f(x), self.scale)
+        # self.state = torch.mul(torch.div(self.f(x), 
+        #                                  np.random.normal(loc=self.z, 
+        #                                                   scale=self.z_std,)), 
+        #                        self.scale)
+
+        self.state = torch.mul(torch.div(self.f(x),
+                                         torch.tensor(np.random.normal(loc=self.z, 
+                                                                       scale=self.z_std, 
+                                                                       size=(1000, 1, 1)),
+                                                                       device=device)),
+                               self.scale)
+
 
         print_stats('Sigma (in degrees)', self.state, self.verbose)
 
@@ -180,7 +209,7 @@ class GaussianSimulator:
         self.data_kwargs = get_data_kwargs(self.params)
 
         rng = np.random.default_rng() if rng is None else rng
-        set_deterministic(self.params['run']['seed'])
+        # set_deterministic(self.params['run']['seed'])
 
         self.deg2pix_coeff = get_deg2pix_coeff(self.params['run'])
 
@@ -203,7 +232,7 @@ class GaussianSimulator:
         verbose = self.params['run']['print_stats']
         self.activation = Activation(params, self.shape, verbose=verbose)
         self.trace = Trace(params, self.shape)
-        self.sigma = Sigma(params, self.shape, self.magnification)
+        self.sigma = Sigma(params, self.shape, self.magnification, device=self.data_kwargs['device'])
         self.brightness = Brightness(params, self.shape)
         self.threshold = ActivationThreshold(params, self.shape, rng)
         self.effective_charge_per_second = None
@@ -221,6 +250,8 @@ class GaussianSimulator:
 
         self._zero = self.to_tensor(0)
         self._inf = self.to_tensor(torch.inf)
+
+        self._imp = self.params['size']['Z2']
 
         self.reset()
 
@@ -265,8 +296,32 @@ class GaussianSimulator:
 
         # Phosphene coordinates
         x_coords, y_coords = coordinates.cartesian
-        x_coords = torch.reshape(self.to_tensor(x_coords), (-1, 1, 1))
-        y_coords = torch.reshape(self.to_tensor(y_coords), (-1, 1, 1))
+
+        # print(x_coords.mean(), x_coords.std(), y_coords.mean(), y_coords.std())
+        # print(x_coords)
+        if self.params['run']['pos_drift'] > 0:
+            print('Adding noise to phosphene locations...')
+            x_coords = self.to_tensor(x_coords)
+            y_coords = self.to_tensor(y_coords)
+
+            # x_coords += torch.randn_like(x_coords) * self.params['run']['xy_std']
+            # y_coords += torch.randn_like(y_coords) * self.params['run']['xy_std']
+
+            # add random drift to the x and y coords, pick a random direction and add the distance
+            phi = torch.rand_like(x_coords) * 2 * math.pi
+            dx = self.params['run']['pos_drift'] * torch.cos(phi)
+            dy = self.params['run']['pos_drift'] * torch.sin(phi)
+            x_coords += dx
+            y_coords += dy
+
+            x_coords = torch.reshape(x_coords, (-1, 1, 1))
+            y_coords = torch.reshape(y_coords, (-1, 1, 1))
+        else:
+            print('No noise added to phosphene locations...')
+
+            x_coords = torch.reshape(self.to_tensor(x_coords), (-1, 1, 1))
+            y_coords = torch.reshape(self.to_tensor(y_coords), (-1, 1, 1))
+
 
         # x,y limits of the simulation
         res_x, res_y = self.params['run']['resolution']
@@ -323,7 +378,7 @@ class GaussianSimulator:
             pulse_width = self._pulse_width
         if frequency is None:
             frequency = self._frequency
-
+            
         charge_per_s = self.get_current(amplitude.view(self.shape),
                                         frequency.view(self.shape),
                                         pulse_width.view(self.shape))
@@ -332,7 +387,7 @@ class GaussianSimulator:
 
         self.trace.update(charge_per_s)
 
-        self.sigma.update(amplitude.view(self.shape))
+        self.sigma.update(amplitude.view(self.shape), device=self.data_kwargs['device'])
 
         self.brightness.update(self.activation.get())
 
@@ -348,7 +403,7 @@ class GaussianSimulator:
 
         leak_current = \
             self.trace.get() + self.params['thresholding']['rheobase']
-        charge_per_s = torch.relu((amplitude - leak_current) *
+        charge_per_s = torch.relu((torch.div(amplitude, self._imp) - leak_current) *
                                   pulse_width * frequency)
         self.effective_charge_per_second = charge_per_s
 

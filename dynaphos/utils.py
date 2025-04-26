@@ -51,7 +51,8 @@ def display_real_size(params: dict, image: np.ndarray):
 
 
 def load_coordinates_from_yaml(path: str, n_coordinates: Optional[int] = None,
-                               rng: Optional[np.random.Generator] = None
+                               rng: Optional[np.random.Generator] = None,
+                               drift: Optional[float] = None
                                ) -> Tuple[np.ndarray, np.ndarray]:
     with open(path, 'r') as f:
         coordinates = yaml.load(f, Loader=yaml.FullLoader)
@@ -64,6 +65,17 @@ def load_coordinates_from_yaml(path: str, n_coordinates: Optional[int] = None,
         sample = rng.choice(len(x), n_coordinates)
         x = x[sample]
         y = y[sample]
+
+    if drift is not None:
+        print('Adding drift to electrode locations.')
+        if rng is None:
+            rng = np.random.default_rng()
+        
+        phi = rng.uniform(0, 2 * np.pi, size=len(x))
+        dx = drift * np.cos(phi)
+        dy = drift * np.sin(phi)
+        x += dx
+        y += dy
 
     return x, y
 
